@@ -114,6 +114,7 @@ static JANET_THREAD_LOCAL int gbl_historyi = 0;
 static JANET_THREAD_LOCAL JanetByteView gbl_matches[JANET_MATCH_MAX];
 static JANET_THREAD_LOCAL int gbl_match_count = 0;
 static JANET_THREAD_LOCAL int gbl_lines_below = 0;
+static JANET_THREAD_LOCAL int gbl_bracketed_paste = 0;
 #endif
 
 /* Fallback */
@@ -1115,7 +1116,7 @@ static int line() {
     if (write_console((char *) gbl_prompt, gbl_plen) == -1) return -1;
     for (;;) {
         char c;
-        char seq[3];
+        char seq[5];
 
         int rc;
         do {
@@ -1188,11 +1189,16 @@ static int line() {
                 refresh();
                 break;
             case 13:    /* enter */
-                /* move cursor to end of multi-line command */
-                gbl_lines_below = gbl_line_count - gbl_linei - 1;
-                if (gbl_lines_below)
-                    cursordown(gbl_lines_below);
-                return 0;
+                if (gbl_bracketed_paste) {
+                    if (insert('\n', 1)) return -1;
+                } else {
+                    /* move cursor to end of multi-line command */
+                    gbl_lines_below = gbl_line_count - gbl_linei - 1;
+                    if (gbl_lines_below)
+                        cursordown(gbl_lines_below);
+                    return 0;
+                }
+                break;
             case 14: /* ctrl-n */
                 historymove(-1);
                 break;
@@ -1241,6 +1247,17 @@ static int line() {
                                     break;
                                 default:
                                     break;
+                            }
+                        }
+                        if (seq[1] == '2' && seq[2] == '0') {
+                            /* Extended escape, read two more bytes. */
+                            if (read_console(seq + 3, 2) == -1) break;
+                            if (seq[4] == '~') {
+                                if (seq[3] == '0') {
+                                    gbl_bracketed_paste = 1;
+                                } else if (seq[3] == '1') {
+                                    gbl_bracketed_paste = 0;
+                                }
                             }
                         }
                     } else if (seq[0] == 'O') {
@@ -1395,6 +1412,9 @@ int main(int argc, char **argv) {
     janet_init_hash_key(hash_key);
 #endif
 
+    printf("\x1b[?2004h"); /* set bracketed-paste mode */
+    fflush(stdout);
+
     /* Set up VM */
     janet_init();
 
@@ -1427,6 +1447,9 @@ int main(int argc, char **argv) {
     /* Deinitialize vm */
     janet_deinit();
     janet_line_deinit();
+
+    printf("\x1b[?2004l"); /* unset bracketed-paste mode */
+    fflush(stdout);
 
     return status;
 }
