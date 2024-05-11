@@ -104,6 +104,9 @@ static JANET_THREAD_LOCAL int gbl_plen = 2;
 static JANET_THREAD_LOCAL char gbl_buf[JANET_LINE_MAX];
 static JANET_THREAD_LOCAL int gbl_len = 0;
 static JANET_THREAD_LOCAL int gbl_pos = 0;
+static JANET_THREAD_LOCAL int gbl_line_count = 1;
+static JANET_THREAD_LOCAL int gbl_linei = 0;
+static JANET_THREAD_LOCAL int gbl_history_mode = 0;
 static JANET_THREAD_LOCAL int gbl_cols = 80;
 static JANET_THREAD_LOCAL char *gbl_history[JANET_HISTORY_MAX];
 static JANET_THREAD_LOCAL int gbl_history_count = 0;
@@ -351,13 +354,46 @@ failed:
 #endif
 }
 
+static int countlines(char *buf) {
+    int count = 1;
+    for (int i=0; buf[i]; i++)
+        count += (buf[i] == '\n');
+    return count;
+}
+
+static int posinline(void) {
+    int pos_in_line = 0;
+    for (int i = gbl_pos - 1; i >= 0 && gbl_buf[i] != '\n'; i--)
+        pos_in_line++;
+    return pos_in_line;
+}
+
+static int findbeginningofline(void) {
+    return gbl_pos - posinline();
+}
+
+static int findendofline(void) {
+    int pos = gbl_pos;
+    while (gbl_buf[pos] != '\0' && gbl_buf[pos] != '\n')
+        pos++;
+    return pos;
+}
+
 static void clear(void) {
     if (write_console("\x1b[H\x1b[2J", 7) <= 0) {
         exit(1);
     }
 }
 
-static void refresh(void) {
+static void cursorup(int count) {
+    fprintf(stderr, "\x1b[%dA", count);
+}
+
+static void cursordown(int count) {
+    fprintf(stderr, "\x1b[%dB", count);
+}
+
+static void refreshline(int linei) {
     char seq[64];
     JanetBuffer b;
 
@@ -375,19 +411,68 @@ static void refresh(void) {
     }
 
     janet_buffer_init(&b, 0);
+
+    char *end;
+    if (gbl_line_count > 1) {
+        /* let _buf point to start of current line
+         * of multi-line input */
+        for (int i = 0; i < linei; i++) {
+            if ((end = strchr(_buf, '\n')))
+                _buf = end + 1;
+        }
+        /* let end point to next '\n' or '\0' */
+        if ((end = strchr(_buf, '\n')) == NULL) {
+            end = gbl_buf + gbl_len;
+        }
+    } else {
+        end = gbl_buf + _len;
+    }
+
+    int pos_in_line = posinline();
+    /* Move cursor up or down to linei */
+    int relative_line = linei - gbl_linei;
+    if (relative_line != 0) {
+        if (relative_line > 0)
+            snprintf(seq, 64, "\x1b[%d%c", relative_line, 'B');
+        else
+            snprintf(seq, 64, "\x1b[%d%c", -relative_line, 'A');
+        janet_buffer_push_cstring(&b, seq);
+    }
     /* Cursor to left edge, gbl_prompt and buffer */
     janet_buffer_push_u8(&b, '\r');
-    janet_buffer_push_cstring(&b, gbl_prompt);
-    janet_buffer_push_bytes(&b, (uint8_t *) _buf, _len);
+    if (linei == 0)
+        janet_buffer_push_cstring(&b, gbl_prompt);
+    else
+        for (size_t i = 0; i < strlen(gbl_prompt); i++) {
+            janet_buffer_push_u8(&b, ' ');
+        }
+    janet_buffer_push_bytes(&b, (uint8_t *) _buf, end - _buf);
     /* Erase to right */
     janet_buffer_push_cstring(&b, "\x1b[0K");
     /* Move cursor to original position. */
-    snprintf(seq, 64, "\r\x1b[%dC", (int)(_pos + gbl_plen));
+    if (relative_line != 0) {
+        if (relative_line > 0)
+            snprintf(seq, 64, "\x1b[%d%c", relative_line, 'A');
+        else
+            snprintf(seq, 64, "\x1b[%d%c", -relative_line, 'B');
+        janet_buffer_push_cstring(&b, seq);
+    }
+    snprintf(seq, 64, "\r\x1b[%dC", (int)(pos_in_line + gbl_plen));
     janet_buffer_push_cstring(&b, seq);
     if (write_console((char *) b.data, b.count) == -1) {
         exit(1);
     }
     janet_buffer_deinit(&b);
+}
+
+static void refresh(void) {
+    refreshline(gbl_linei);
+}
+
+static void refreshall(void) {
+    for (int i = 0; i < gbl_line_count; i++) {
+        refreshline(i);
+    }
 }
 
 static void clearlines(void) {
@@ -403,11 +488,28 @@ static void clearlines(void) {
 
 static int insert(char c, int draw) {
     if (gbl_len < JANET_LINE_MAX - 1) {
-        if (gbl_len == gbl_pos) {
+        if (c == '\n') {
+            if (gbl_len != gbl_pos)
+                memmove(gbl_buf + gbl_pos + 1, gbl_buf + gbl_pos, gbl_len - gbl_pos);
+            gbl_buf[gbl_pos++] = c;
+            gbl_buf[++gbl_len] = '\0';
+            gbl_linei++;
+            gbl_line_count++;
+            gbl_lines_below = gbl_line_count - gbl_linei - 1;
+            if (gbl_lines_below)
+                cursordown(gbl_lines_below);
+            FILE *out = janet_dynfile("err", stderr);
+            fputc('\n', out);
+            if (gbl_lines_below)
+                cursorup(gbl_lines_below);
+            if (draw)
+                refreshall();
+        } else if (gbl_len == gbl_pos) {
             gbl_buf[gbl_pos++] = c;
             gbl_buf[++gbl_len] = '\0';
             if (draw) {
                 if (gbl_plen + gbl_len < gbl_cols) {
+                    /* TODO: Fix for multi-line */
                     /* Avoid a full update of the line in the
                      * trivial case. */
                     if (write_console(&c, 1) == -1) return -1;
@@ -436,11 +538,21 @@ static void historymove(int delta) {
         } else if (gbl_historyi >= gbl_history_count) {
             gbl_historyi = gbl_history_count - 1;
         }
+        if (gbl_linei > 0)
+            cursorup(gbl_linei);
+        gbl_lines_below = gbl_line_count - 1;
+        clearlines();
         strncpy(gbl_buf, gbl_history[gbl_historyi], JANET_LINE_MAX - 1);
         gbl_pos = gbl_len = (int) strlen(gbl_buf);
         gbl_buf[gbl_len] = '\0';
-
-        refresh();
+        gbl_line_count = countlines(gbl_buf);
+        FILE *out = janet_dynfile("err", stderr);
+        for (gbl_linei = 0; gbl_linei < gbl_line_count; gbl_linei++) {
+            refreshline(gbl_linei);
+            if (gbl_linei != gbl_line_count -1)
+                fputc('\n', out);
+        }
+        gbl_linei = gbl_line_count - 1;
     }
 }
 
@@ -478,25 +590,84 @@ static void replacehistory(void) {
     }
 }
 
+static void kup(void) {
+    if (gbl_history_mode && gbl_pos == gbl_len) {
+        historymove(1);
+    } else if (gbl_linei > 0) {
+        gbl_linei--;
+        gbl_lines_below++;
+        /* update gbl_pos */
+        int pos_in_line = posinline();
+        gbl_pos -= pos_in_line;
+        gbl_pos--;
+        while (gbl_pos > 0 && gbl_buf[gbl_pos-1] != '\n') {
+            gbl_pos--;
+        }
+        for (int i = 0; i < pos_in_line &&
+                gbl_buf[gbl_pos] &&
+                gbl_buf[gbl_pos] != '\n'; i++)
+            gbl_pos++;
+        cursorup(1);
+        refresh();
+    }
+}
+
+static void kdown(void) {
+    if (gbl_history_mode && gbl_pos == gbl_len) {
+        historymove(-1);
+    } else if (gbl_linei < gbl_line_count - 1) {
+        gbl_linei++;
+        if (gbl_lines_below > 0) /* TODO: Check should not be necessary */
+            gbl_lines_below--;
+        /* update gbl_pos */
+        int pos_in_line = posinline();
+        while (gbl_buf[gbl_pos] && gbl_buf[gbl_pos] != '\n') {
+            gbl_pos++;
+        }
+        gbl_pos++;
+        for (int i = 0; i < pos_in_line &&
+                gbl_buf[gbl_pos] &&
+                gbl_buf[gbl_pos] != '\n'; i++)
+            gbl_pos++;
+        cursordown(1);
+        refresh();
+    }
+}
+
 static void kleft(void) {
     if (gbl_pos > 0) {
         gbl_pos--;
-        refresh();
+        if (gbl_buf[gbl_pos] == '\n') {
+            gbl_linei--;
+            cursorup(1);
+        }
+        refreshline(gbl_linei);
+        gbl_history_mode = 0;
     }
 }
 
 static void kleftw(void) {
     while (gbl_pos > 0 && isspace(gbl_buf[gbl_pos - 1])) {
+        if (gbl_buf[gbl_pos - 1] == '\n') {
+            gbl_linei--;
+            gbl_lines_below++;
+            cursorup(1);
+        }
         gbl_pos--;
     }
     while (gbl_pos > 0 && !isspace(gbl_buf[gbl_pos - 1])) {
         gbl_pos--;
     }
     refresh();
+    gbl_history_mode = 0;
 }
 
 static void kright(void) {
     if (gbl_pos != gbl_len) {
+        if (gbl_buf[gbl_pos] == '\n') {
+            gbl_linei++;
+            cursordown(1);
+        }
         gbl_pos++;
         refresh();
     }
@@ -504,6 +675,11 @@ static void kright(void) {
 
 static void krightw(void) {
     while (gbl_pos != gbl_len && isspace(gbl_buf[gbl_pos])) {
+        if (gbl_buf[gbl_pos] == '\n') {
+            gbl_linei++;
+            gbl_lines_below--;
+            cursordown(1);
+        }
         gbl_pos++;
     }
     while (gbl_pos != gbl_len && !isspace(gbl_buf[gbl_pos])) {
@@ -514,29 +690,66 @@ static void krightw(void) {
 
 static void kbackspace(int draw) {
     if (gbl_pos > 0) {
+        int deletenewline = (gbl_buf[gbl_pos-1] == '\n');
+        if (deletenewline) {
+            gbl_linei--;
+            gbl_line_count--;
+            gbl_lines_below++;
+            /* gbl_lines_below = gbl_line_count - gbl_linei; */
+            cursorup(1);
+        }
         memmove(gbl_buf + gbl_pos - 1, gbl_buf + gbl_pos, gbl_len - gbl_pos);
         gbl_pos--;
         gbl_buf[--gbl_len] = '\0';
-        if (draw) refresh();
+        if (draw) {
+            if (deletenewline) {
+                clearlines();
+                refreshall();
+            } else {
+                refresh();
+            }
+        }
+        gbl_history_mode = 0;
     }
 }
 
 static void kdelete(int draw) {
     if (gbl_pos != gbl_len) {
+        int deletenewline = (gbl_buf[gbl_pos] == '\n');
+        if (deletenewline) {
+            gbl_line_count--;
+        }
         memmove(gbl_buf + gbl_pos, gbl_buf + gbl_pos + 1, gbl_len - gbl_pos);
         gbl_buf[--gbl_len] = '\0';
-        if (draw) refresh();
+        if (draw) {
+            if (deletenewline) {
+                gbl_lines_below = gbl_line_count - gbl_linei;
+                clearlines();
+                refreshall();
+            } else {
+                refresh();
+            }
+        }
+        gbl_history_mode = 0;
     }
 }
 
 static void kbackspacew(void) {
+    int multiline = (gbl_line_count > 1);
     while (gbl_pos && isspace(gbl_buf[gbl_pos - 1])) {
         kbackspace(0);
     }
     while (gbl_pos && !isspace(gbl_buf[gbl_pos - 1])) {
         kbackspace(0);
     }
-    refresh();
+    if (multiline) {
+        clearlines();
+        refreshall();
+        /* fprintf(stderr, "lb:%d", gbl_lines_below); */
+    } else {
+        refresh();
+    }
+    gbl_history_mode = 0;
 }
 
 static void kdeletew(void) {
@@ -547,6 +760,37 @@ static void kdeletew(void) {
         kdelete(0);
     }
     refresh();
+    gbl_history_mode = 0;
+}
+
+static void backwardkillline(void) {
+    if (gbl_pos > 0) {
+        if (gbl_buf[gbl_pos-1] == '\n') {
+            kbackspace(1);
+        } else {
+            int pos_in_line = posinline();
+            memmove(gbl_buf + gbl_pos - pos_in_line, gbl_buf + gbl_pos, gbl_len - gbl_pos);
+            gbl_len -= pos_in_line;
+            gbl_buf[gbl_len] = '\0';
+            gbl_pos -= pos_in_line;
+            refresh();
+        }
+    gbl_history_mode = 0;
+    }
+}
+
+static void joinlines(void) {
+    if (gbl_line_count > 1) {
+        if (gbl_linei + 1 == gbl_line_count) {
+            gbl_pos = findbeginningofline();
+            kbackspace(1);
+        } else {
+            gbl_pos = findendofline();
+            kdelete(1);
+        }
+        insert(' ', 0);
+        kleft();
+    }
 }
 
 /* See tools/symchargen.c */
@@ -791,7 +1035,7 @@ static void kshowdoc(void) {
     fprintf(stderr, "\n\n");
     gbl_lines_below += 2;
     /* Go up to original line (zsh-like autocompletion) */
-    fprintf(stderr, "\x1B[%dA", gbl_lines_below);
+    cursorup(gbl_lines_below);
     fflush(stderr);
 }
 
@@ -849,7 +1093,7 @@ static void kshowcomp(void) {
         }
 
         /* Go up to original line (zsh-like autocompletion) */
-        fprintf(stderr, "\x1B[%dA", gbl_lines_below);
+        cursorup(gbl_lines_below);
 
         fflush(stderr);
     }
@@ -860,6 +1104,9 @@ static int line() {
     gbl_plen = 0;
     gbl_len = 0;
     gbl_pos = 0;
+    gbl_linei = 0;
+    gbl_line_count = 1;
+    gbl_history_mode = 1;
     while (gbl_prompt[gbl_plen]) gbl_plen++;
     gbl_buf[0] = '\0';
 
@@ -882,7 +1129,8 @@ static int line() {
                 if (insert(c, 1)) return -1;
                 break;
             case 1:     /* ctrl-a */
-                gbl_pos = 0;
+                gbl_pos -= posinline();
+                gbl_history_mode = 0;
                 refresh();
                 break;
             case 2:     /* ctrl-b */
@@ -909,7 +1157,7 @@ static int line() {
                 kdelete(1);
                 break;
             case 5:     /* ctrl-e */
-                gbl_pos = gbl_len;
+                gbl_pos = findendofline();
                 refresh();
                 break;
             case 6:     /* ctrl-f */
@@ -927,6 +1175,9 @@ static int line() {
                 kshowcomp();
                 refresh();
                 break;
+            case 10: /* ctrl-j */
+                joinlines();
+                break;
             case 11: /* ctrl-k */
                 gbl_buf[gbl_pos] = '\0';
                 gbl_len = gbl_pos;
@@ -937,7 +1188,10 @@ static int line() {
                 refresh();
                 break;
             case 13:    /* enter */
-                clearlines();
+                /* move cursor to end of multi-line command */
+                gbl_lines_below = gbl_line_count - gbl_linei - 1;
+                if (gbl_lines_below)
+                    cursordown(gbl_lines_below);
                 return 0;
             case 14: /* ctrl-n */
                 historymove(-1);
@@ -945,14 +1199,9 @@ static int line() {
             case 16: /* ctrl-p */
                 historymove(1);
                 break;
-            case 21: { /* ctrl-u */
-                memmove(gbl_buf, gbl_buf + gbl_pos, gbl_len - gbl_pos);
-                gbl_len -= gbl_pos;
-                gbl_buf[gbl_len] = '\0';
-                gbl_pos = 0;
-                refresh();
+            case 21: /* ctrl-u */
+                backwardkillline();
                 break;
-            }
             case 23: /* ctrl-w */
                 kbackspacew();
                 break;
@@ -979,14 +1228,15 @@ static int line() {
                         if (seq[2] == '~') {
                             switch (seq[1]) {
                                 case '1': /* Home */
-                                    gbl_pos = 0;
+                                    gbl_pos -= posinline();
+                                    gbl_history_mode = 0;
                                     refresh();
                                     break;
                                 case '3': /* delete */
                                     kdelete(1);
                                     break;
                                 case '4': /* End */
-                                    gbl_pos = gbl_len;
+                                    gbl_pos = findendofline();
                                     refresh();
                                     break;
                                 default:
@@ -1013,10 +1263,10 @@ static int line() {
                             default:
                                 break;
                             case 'A': /* Up */
-                                historymove(1);
+                                kup();
                                 break;
                             case 'B': /* Down */
-                                historymove(-1);
+                                kdown();
                                 break;
                             case 'C': /* Right */
                                 kright();
@@ -1054,6 +1304,9 @@ static int line() {
                         case '.': /* Alt-. */
                             historymove(-JANET_HISTORY_MAX);
                             break;
+                        case 13: /* Alt-enter */
+                            if (insert('\n', 1)) return -1;
+                            break;
                         case 127: /* Alt-backspace */
                             kbackspacew();
                             break;
@@ -1061,6 +1314,8 @@ static int line() {
                 }
                 break;
         }
+        if (gbl_len == 0)
+            gbl_history_mode = 1;
     }
     return 0;
 }
