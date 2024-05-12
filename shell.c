@@ -98,6 +98,7 @@ static void simpleline(JanetBuffer *buffer) {
 #define JANET_LINE_MAX 1024
 #define JANET_MATCH_MAX 256
 #define JANET_HISTORY_MAX 100
+#define JANET_PATH_MAX 256
 static JANET_THREAD_LOCAL int gbl_israwmode = 0;
 static JANET_THREAD_LOCAL const char *gbl_prompt = "> ";
 static JANET_THREAD_LOCAL int gbl_plen = 2;
@@ -108,6 +109,7 @@ static JANET_THREAD_LOCAL int gbl_line_count = 1;
 static JANET_THREAD_LOCAL int gbl_linei = 0;
 static JANET_THREAD_LOCAL int gbl_history_mode = 0;
 static JANET_THREAD_LOCAL int gbl_cols = 80;
+static JANET_THREAD_LOCAL char gbl_history_file[JANET_PATH_MAX] = "";
 static JANET_THREAD_LOCAL char *gbl_history[JANET_HISTORY_MAX];
 static JANET_THREAD_LOCAL int gbl_history_count = 0;
 static JANET_THREAD_LOCAL int gbl_historyi = 0;
@@ -355,6 +357,15 @@ failed:
 #endif
 }
 
+static int prefix(const char *pre, const char *str) {
+    return strncmp(pre, str, strlen(pre)) == 0;
+}
+
+static void removetrailingnewline(void) {
+    if (gbl_len && gbl_buf[gbl_len-1] == '\n')
+        gbl_buf[--gbl_len] = '\0';
+}
+
 static int countlines(char *buf) {
     int count = 1;
     for (int i=0; buf[i]; i++)
@@ -562,6 +573,7 @@ static void addhistory(void) {
     char *newline = sdup(gbl_buf);
     if (!newline) return;
     len = gbl_history_count;
+    if (len > 0 && strcmp(newline, gbl_history[0]) == 0) return;
     if (len < JANET_HISTORY_MAX) {
         gbl_history[gbl_history_count++] = newline;
         len++;
@@ -572,6 +584,54 @@ static void addhistory(void) {
         gbl_history[i] = gbl_history[i - 1];
     }
     gbl_history[0] = newline;
+}
+
+static void savehistory(void) {
+    FILE *fptr = fopen(gbl_history_file, "w+");
+    if (fptr == NULL) {
+        printf("Could not open '%s'.\n", gbl_history_file);
+        return;
+    }
+    for (int i = gbl_history_count -1; i >= 0; i--) {
+        if (strlen(gbl_history[i]) > 0)
+            fprintf(fptr, ">>> %s\n", gbl_history[i]);
+    }
+    fclose(fptr);
+}
+
+static void loadhistory(void) {
+    char *home = getenv("HOME");
+    size_t lenhome = strlen(home);
+    strncpy(gbl_history_file, home, JANET_PATH_MAX);
+    strncpy(gbl_history_file + lenhome, "/.local/share/janet-good-repl/history",
+            JANET_MATCH_MAX - lenhome);
+
+    FILE *fptr = fopen(gbl_history_file, "r");
+    if (fptr == NULL) {
+        printf("Could not open '%s'.\n", gbl_history_file);
+        return;
+    }
+    char line[4096];
+    char *p;
+    while(fgets(line, 4096, fptr)) {
+        p = line;
+        if (prefix(">>> ", line)) {
+            removetrailingnewline();
+            if (gbl_len)
+                addhistory();
+            gbl_buf[0] = '\0';
+            gbl_len = 0;
+            p += 4;
+        }
+        int lenline = strlen(p);
+        memcpy(gbl_buf + gbl_len, p, lenline);
+        gbl_len += lenline;
+        gbl_buf[gbl_len] = '\0';
+    }
+    removetrailingnewline();
+    if (gbl_len)
+        addhistory();
+    fclose(fptr);
 }
 
 static void replacehistory(void) {
@@ -1140,6 +1200,7 @@ static int line() {
             case 3:     /* ctrl-c */
                 clearlines();
                 norawmode();
+                savehistory();
 #ifdef _WIN32
                 ExitProcess(1);
 #else
@@ -1358,6 +1419,7 @@ void janet_line_get(const char *p, JanetBuffer *buffer) {
     if (line()) {
         norawmode();
         fputc('\n', out);
+        savehistory();
         return;
     }
     fflush(stdin);
@@ -1412,6 +1474,7 @@ int main(int argc, char **argv) {
     janet_init_hash_key(hash_key);
 #endif
 
+    loadhistory();
     printf("\x1b[?2004h"); /* set bracketed-paste mode */
     fflush(stdout);
 
